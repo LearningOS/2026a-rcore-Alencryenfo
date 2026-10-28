@@ -21,9 +21,18 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the process with the smallest stride out of the ready queue.
+    /// The selected process is charged one time slice before it runs.
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let idx = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, task)| task.get_stride())
+            .map(|(idx, _)| idx)?;
+        let task = self.ready_queue.remove(idx)?;
+        task.bump_stride();
+        Some(task)
     }
 }
 
