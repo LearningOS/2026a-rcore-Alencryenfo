@@ -49,6 +49,14 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// whether deadlock detection is enabled for this process
+    pub deadlock_detect: bool,
+    /// Allocation[tid][sem_id]: units of each semaphore held by each thread
+    pub sem_alloc: Vec<Vec<usize>>,
+    /// Need[tid][sem_id]: pending requests of each thread
+    pub sem_need: Vec<Vec<usize>>,
+    /// owner thread of each mutex
+    pub mutex_owner: Vec<Option<usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +89,105 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    /// Make sure the tracking rows for `tid` are long enough.
+    fn ensure_sem_tracking(&mut self, tid: usize) {
+        while self.sem_alloc.len() <= tid {
+            self.sem_alloc.push(Vec::new());
+            self.sem_need.push(Vec::new());
+        }
+        let n = self.semaphore_list.len();
+        while self.sem_alloc[tid].len() < n {
+            self.sem_alloc[tid].push(0);
+        }
+        while self.sem_need[tid].len() < n {
+            self.sem_need[tid].push(0);
+        }
+    }
+
+    /// Record that `tid` acquired one unit of `sem_id`.
+    pub fn sem_alloc_one(&mut self, tid: usize, sem_id: usize) {
+        self.ensure_sem_tracking(tid);
+        self.sem_alloc[tid][sem_id] += 1;
+    }
+
+    /// Record that `tid` released one unit of `sem_id`.
+    pub fn sem_free_one(&mut self, tid: usize, sem_id: usize) {
+        self.ensure_sem_tracking(tid);
+        if self.sem_alloc[tid][sem_id] > 0 {
+            self.sem_alloc[tid][sem_id] -= 1;
+        }
+    }
+
+    /// Register a pending request and report whether the resulting state is
+    /// safe. When unsafe, the request is rolled back.
+    pub fn try_sem_request(&mut self, tid: usize, sem_id: usize) -> bool {
+        self.ensure_sem_tracking(tid);
+        self.sem_need[tid][sem_id] += 1;
+        if self.sem_state_safe() {
+            true
+        } else {
+            self.sem_need[tid][sem_id] -= 1;
+            false
+        }
+    }
+
+    /// The pending request was satisfied: turn it into an allocation.
+    pub fn complete_sem_request(&mut self, tid: usize, sem_id: usize) {
+        self.ensure_sem_tracking(tid);
+        if self.sem_need[tid][sem_id] > 0 {
+            self.sem_need[tid][sem_id] -= 1;
+        }
+        self.sem_alloc[tid][sem_id] += 1;
+    }
+
+    /// Banker's safety check over the semaphores of this process.
+    fn sem_state_safe(&self) -> bool {
+        let nsem = self.semaphore_list.len();
+        let mut available: Vec<usize> = (0..nsem)
+            .map(|j| {
+                self.semaphore_list[j]
+                    .as_ref()
+                    .map(|sem| sem.available())
+                    .unwrap_or(0)
+            })
+            .collect();
+        let nthreads = self.sem_alloc.len().max(self.sem_need.len());
+        let mut finish = vec![false; nthreads];
+        loop {
+            let mut progressed = false;
+            for tid in 0..nthreads {
+                if finish[tid] {
+                    continue;
+                }
+                let can_finish = (0..nsem).all(|j| {
+                    let need = self
+                        .sem_need
+                        .get(tid)
+                        .and_then(|row| row.get(j))
+                        .copied()
+                        .unwrap_or(0);
+                    need <= available[j]
+                });
+                if can_finish {
+                    finish[tid] = true;
+                    for (j, work) in available.iter_mut().enumerate() {
+                        *work += self
+                            .sem_alloc
+                            .get(tid)
+                            .and_then(|row| row.get(j))
+                            .copied()
+                            .unwrap_or(0);
+                    }
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        finish.iter().all(|&done| done)
     }
 }
 
@@ -119,6 +226,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    sem_alloc: Vec::new(),
+                    sem_need: Vec::new(),
+                    mutex_owner: Vec::new(),
                 })
             },
         });
@@ -245,6 +356,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    sem_alloc: Vec::new(),
+                    sem_need: Vec::new(),
+                    mutex_owner: Vec::new(),
                 })
             },
         });

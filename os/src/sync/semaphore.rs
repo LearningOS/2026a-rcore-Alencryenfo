@@ -29,16 +29,25 @@ impl Semaphore {
         }
     }
 
-    /// up operation of semaphore
-    pub fn up(&self) {
+    /// Number of units currently available.
+    pub fn available(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.count.max(0) as usize
+    }
+
+    /// up operation of semaphore. Returns the task that received the unit
+    /// directly, if any.
+    pub fn up(&self) -> Option<Arc<TaskControlBlock>> {
         trace!("kernel: Semaphore::up");
         let mut inner = self.inner.exclusive_access();
         inner.count += 1;
         if inner.count <= 0 {
             if let Some(task) = inner.wait_queue.pop_front() {
-                wakeup_task(task);
+                wakeup_task(task.clone());
+                return Some(task);
             }
         }
+        None
     }
 
     /// down operation of semaphore

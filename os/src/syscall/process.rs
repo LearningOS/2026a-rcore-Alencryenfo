@@ -1,12 +1,75 @@
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{translated_ref, translated_refmut, translated_str, PageTableEntry, VirtAddr},
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
     },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
+
+/// Look up the PTE of the page containing user address `addr`.
+fn user_pte(addr: usize) -> Option<PageTableEntry> {
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    let pte = inner.memory_set.translate(VirtAddr::from(addr).floor())?;
+    if pte.is_valid() {
+        Some(pte)
+    } else {
+        None
+    }
+}
+
+/// Physical address of user address `addr` according to its PTE.
+fn user_pa(pte: PageTableEntry, addr: usize) -> usize {
+    pte.ppn().0 * PAGE_SIZE + (addr & (PAGE_SIZE - 1))
+}
+
+/// Check that every page touched by `[addr, addr + len)` is writable from
+/// user mode.
+fn user_range_writable(addr: usize, len: usize) -> bool {
+    let mut offset = 0;
+    while offset < len {
+        let va = match addr.checked_add(offset) {
+            Some(va) => va,
+            None => return false,
+        };
+        let pte = match user_pte(va) {
+            Some(pte) => pte,
+            None => return false,
+        };
+        if !pte.user() || !pte.writable() {
+            return false;
+        }
+        offset += PAGE_SIZE - (va & (PAGE_SIZE - 1));
+    }
+    true
+}
+
+/// Copy `data` into the current user address space at `addr`.
+fn copy_to_user(addr: usize, data: &[u8]) -> bool {
+    if !user_range_writable(addr, data.len()) {
+        return false;
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        let va = addr + offset;
+        let pte = user_pte(va).unwrap();
+        let page_offset = va & (PAGE_SIZE - 1);
+        let n = (PAGE_SIZE - page_offset).min(data.len() - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data[offset..offset + n].as_ptr(),
+                user_pa(pte, va) as *mut u8,
+                n,
+            );
+        }
+        offset += n;
+    }
+    true
+}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -147,16 +210,27 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 }
 
 /// get_time syscall
-///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if copy_to_user(ts as usize, bytes) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// mmap syscall
