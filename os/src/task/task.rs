@@ -1,9 +1,9 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -71,6 +71,15 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Scheduling priority
+    pub priority: usize,
+
+    /// Accumulated stride used by the stride scheduler
+    pub stride: usize,
+
+    /// Increment of `stride` after each time slice
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +144,9 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0,
+                    pass: BIG_STRIDE / 16,
                 })
             },
         };
@@ -216,6 +228,9 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: 16,
+                    stride: 0,
+                    pass: BIG_STRIDE / 16,
                 })
             },
         });
@@ -229,6 +244,45 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Create a child process that runs the program in `elf_data` without
+    /// copying the parent's address space (unlike `fork`).
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let task = Arc::new(Self::new(elf_data));
+        task.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(task.clone());
+        task
+    }
+
+    /// Get the current stride value used by the scheduler.
+    pub fn get_stride(&self) -> usize {
+        self.inner_exclusive_access().stride
+    }
+
+    /// Account one time slice to this task.
+    pub fn bump_stride(&self) {
+        let mut inner = self.inner_exclusive_access();
+        inner.stride = inner.stride.wrapping_add(inner.pass);
+    }
+
+    /// Set scheduling priority (must be >= 2).
+    pub fn set_priority(&self, priority: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+        inner.pass = BIG_STRIDE / priority;
+    }
+
+    /// Map `[start, start + len)` in this process's address space.
+    pub fn mmap(&self, start: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        self.inner_exclusive_access()
+            .memory_set
+            .mmap(start, len, permission)
+    }
+
+    /// Unmap `[start, end)` in this process's address space.
+    pub fn munmap(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        self.inner_exclusive_access().memory_set.munmap(start, end)
     }
 
     /// get pid of process

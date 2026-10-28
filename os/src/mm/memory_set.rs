@@ -283,6 +283,83 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Whether `vpn` is mapped in this address space.
+    pub fn is_mapped(&self, vpn: VirtPageNum) -> bool {
+        self.page_table
+            .translate(vpn)
+            .map(|pte| pte.is_valid())
+            .unwrap_or(false)
+    }
+    /// Map `len` bytes starting at page-aligned `start` with `permission`.
+    /// Fails if the range is already (partially) mapped.
+    pub fn mmap(&mut self, start: VirtAddr, len: usize, permission: MapPermission) -> bool {
+        if !start.aligned() {
+            return false;
+        }
+        let end = match start.0.checked_add(len) {
+            Some(end) => VirtAddr::from(end),
+            None => return false,
+        };
+        for vpn in VPNRange::new(start.floor(), end.ceil()) {
+            if self.is_mapped(vpn) {
+                return false;
+            }
+        }
+        self.push(
+            MapArea::new(start, end, MapType::Framed, permission),
+            None,
+        );
+        true
+    }
+    /// Unmap `[start, end)`. Fails (without changing anything) if any page in
+    /// the range is not mapped.
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        if !start.aligned() {
+            return false;
+        }
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        if start_vpn.0 >= end_vpn.0 {
+            return true;
+        }
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if !self.is_mapped(vpn) {
+                return false;
+            }
+        }
+        let mut remaining_areas = Vec::new();
+        for mut area in self.areas.drain(..) {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            let overlap_start = if area_start.0 > start_vpn.0 {
+                area_start
+            } else {
+                start_vpn
+            };
+            let overlap_end = if area_end.0 < end_vpn.0 {
+                area_end
+            } else {
+                end_vpn
+            };
+            if overlap_start.0 >= overlap_end.0 {
+                remaining_areas.push(area);
+                continue;
+            }
+            for vpn in VPNRange::new(overlap_start, overlap_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+            // Keep the parts before/after the removed range (possibly splitting
+            // one area into two).
+            if area_start.0 < overlap_start.0 {
+                remaining_areas.push(area.slice(area_start, overlap_start));
+            }
+            if overlap_end.0 < area_end.0 {
+                remaining_areas.push(area.slice(overlap_end, area_end));
+            }
+        }
+        self.areas = remaining_areas;
+        true
+    }
 
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
@@ -395,6 +472,27 @@ impl MapArea {
             self.map_one(page_table, vpn)
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+    /// Create a new `MapArea` covering `[start_vpn, end_vpn)` of this area,
+    /// moving the corresponding frames into it.
+    fn slice(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> MapArea {
+        let mut sliced = MapArea::new(
+            start_vpn.into(),
+            end_vpn.into(),
+            self.map_type,
+            self.map_perm,
+        );
+        let vpns: Vec<VirtPageNum> = self
+            .data_frames
+            .range(start_vpn..end_vpn)
+            .map(|(vpn, _)| *vpn)
+            .collect();
+        for vpn in vpns {
+            if let Some(frame) = self.data_frames.remove(&vpn) {
+                sliced.data_frames.insert(vpn, frame);
+            }
+        }
+        sliced
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
